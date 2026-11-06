@@ -85,3 +85,25 @@ project.yml
 ## Конфиденциальность
 
 Исходники не содержат сетевых вызовов, трекеров и API-ключей. Импортированные PDF копируются в папку приложения. Кеш OCR лежит в системном каталоге кешей и может быть очищен iOS. Метаданные библиотеки сохраняются локально в JSON.
+
+## Исправление сборки ReaderView (6 ноября 2026)
+
+При сообщении Xcode `the compiler is unable to type-check this expression in reasonable time` для `BookVoice/Views/ReaderView.swift:16:25` структура `ReaderView` разделена на небольшие computed views и методы (`readerContent`, `documentContent`, `pageHeader`, `pageJumpSheet`, `playerPanel` и др.). Дополнительно указан явный `Color.primary` вместо неявного стиля в обводке и разделителе.
+
+Для обновления существующего GitHub-репозитория достаточно заменить **один файл** `BookVoice/Views/ReaderView.swift` на исправленный и сделать commit в `main`. Изменять настройки Actions или переустанавливать Xcode не требуется. Полноценная сборка iOS из Linux не проверена: Xcode доступен только в macOS.
+
+
+## Исправление сборки Xcode 16.4: AVSpeechSynthesizerDelegate и ReaderView (6 ноября 2026)
+
+Лог `cannot assign value of type 'BookSpeechPlayer' to type '(any AVSpeechSynthesizerDelegate)?'` исправлен добавлением явного соответствия `AVSpeechSynthesizerDelegate`, а методы делегата помечены ObjC-селекторами.
+
+В логах также `ReaderView.swift:16:25` — признак того, что GitHub собирает **старую версию файла** с большим `body`; в этом архиве `body` начинается на **строке 18** и разделён на подкомпоненты.
+
+**Нужно заменить два файла в репозитории в тех же путях:**
+
+- `BookVoice/Services/BookSpeechPlayer.swift`
+- `BookVoice/Views/ReaderView.swift`
+
+Затем выполнить commit/push в ветку `main` и проверить новый run Actions, чтобы он действительно использовал новый commit.
+
+На Linux выполнена синтаксическая проверка Swift-файлов. Полноценная сборка под iOS требует macOS/Xcode и не была подтверждена в этой среде.

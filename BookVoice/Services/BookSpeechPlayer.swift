@@ -4,7 +4,7 @@ import AVFoundation
 import Combine
 
 @MainActor
-final class BookSpeechPlayer: NSObject, ObservableObject {
+final class BookSpeechPlayer: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     enum State: Equatable { case stopped, loading, speaking, paused }
 
     @Published private(set) var state: State = .stopped
@@ -227,6 +227,7 @@ final class BookSpeechPlayer: NSObject, ObservableObject {
 
     // MARK: - AVSpeechSynthesizerDelegate
 
+    @objc(speechSynthesizer:didFinishSpeechUtterance:)
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
         Task { @MainActor [weak self] in
             guard let self, self.currentUtterance === utterance else { return }
@@ -237,6 +238,7 @@ final class BookSpeechPlayer: NSObject, ObservableObject {
         }
     }
 
+    @objc(speechSynthesizer:didCancelSpeechUtterance:)
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
         // A stop/skip invalidates the current utterance before cancellation is delivered.
     }
