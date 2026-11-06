@@ -2,9 +2,12 @@ import Foundation
 import PDFKit
 import AVFoundation
 import Combine
+import NaturalLanguage
+import MediaPlayer
+import UIKit
 
 @MainActor
-final class BookSpeechPlayer: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
+final class BookSpeechPlayer: NSObject, ObservableObject {
     enum State: Equatable { case stopped, loading, speaking, paused }
 
     @Published private(set) var state: State = .stopped
@@ -13,27 +16,56 @@ final class BookSpeechPlayer: NSObject, ObservableObject, AVSpeechSynthesizerDel
     @Published private(set) var pageProgress: Double = 0
     @Published private(set) var notice: String?
     @Published private(set) var recognizedPage = false
+    @Published private(set) var spokenSentence = ""
+    @Published private(set) var sleepRemainingSeconds = 0
+    @Published private(set) var sleepDeadline: Date?
 
     @Published var rate: Float = 0.5
-    @Published var chosenVoiceID: String = "automatic"
+    @Published var chosenVoiceID = "automatic"
 
     private let synthesizer = AVSpeechSynthesizer()
+    private let speechDelegate = SpeechDelegateProxy()
+    private let remote = LockScreenPlayer()
     private var document: PDFDocument?
     private var activeBookID: UUID?
+    private var activeBookTitle = "BookVoice"
+    private var artwork: MPMediaItemArtwork?
     private var task: Task<Void, Never>?
     private var chunks: [String] = []
     private var chunkIndex = 0
     private var currentUtterance: AVSpeechUtterance?
+    private var sentenceRanges: [NSRange] = []
+    private var currentSentenceIndex = -1
     private var generation: UInt = 0
+    private var sleepTimer: Timer?
 
     var didChangePage: ((UUID, Int) -> Void)?
 
     override init() {
         super.init()
-        synthesizer.delegate = self
+        // Keep the synthesizer's Obj-C delegate separate from this MainActor model.
+        speechDelegate.onStart = { [weak self] utterance in
+            Task { @MainActor [weak self] in self?.handleStarted(utterance) }
+        }
+        speechDelegate.onWord = { [weak self] utterance, range in
+            Task { @MainActor [weak self] in self?.handleWord(utterance, range: range) }
+        }
+        speechDelegate.onFinish = { [weak self] utterance in
+            Task { @MainActor [weak self] in self?.handleFinished(utterance) }
+        }
+        synthesizer.delegate = speechDelegate
+
         let stored = UserDefaults.standard.float(forKey: "speechRate")
         rate = stored == 0 ? 0.5 : stored
         chosenVoiceID = UserDefaults.standard.string(forKey: "voiceID") ?? "automatic"
+
+        remote.install(
+            play: { [weak self] in self?.remotePlay() },
+            pause: { [weak self] in self?.remotePause() },
+            toggle: { [weak self] in self?.playOrPause() },
+            next: { [weak self] in self?.nextPage() },
+            previous: { [weak self] in self?.previousPage() }
+        )
     }
 
     func open(book: Book, at url: URL) {
@@ -44,11 +76,21 @@ final class BookSpeechPlayer: NSObject, ObservableObject, AVSpeechSynthesizerDel
             return
         }
         activeBookID = book.id
+        activeBookTitle = book.title
         document = pdf
         pageCount = pdf.pageCount
         currentPage = min(max(book.lastPage, 0), pdf.pageCount - 1)
         pageProgress = 0
+        spokenSentence = ""
         notice = nil
+
+        // Generated completely offline from the PDF's first page.
+        if let cover = pdf.page(at: 0)?.thumbnail(of: CGSize(width: 420, height: 600), for: .mediaBox) {
+            artwork = MPMediaItemArtwork(boundsSize: cover.size) { _ in cover }
+        } else {
+            artwork = nil
+        }
+        remote.setEnabled(true)
     }
 
     func isCurrentBook(_ id: UUID) -> Bool { activeBookID == id }
@@ -60,11 +102,13 @@ final class BookSpeechPlayer: NSObject, ObservableObject, AVSpeechSynthesizerDel
         pageCount = 0
         currentPage = 0
         pageProgress = 0
+        artwork = nil
+        remote.clear()
     }
 
-    func setRate(_ newValue: Float) {
-        rate = newValue
-        UserDefaults.standard.set(newValue, forKey: "speechRate")
+    func setRate(_ value: Float) {
+        rate = value
+        UserDefaults.standard.set(value, forKey: "speechRate")
     }
 
     func setVoice(_ id: String) {
@@ -74,26 +118,54 @@ final class BookSpeechPlayer: NSObject, ObservableObject, AVSpeechSynthesizerDel
 
     func playOrPause() {
         switch state {
-        case .speaking:
-            if synthesizer.pauseSpeaking(at: .immediate) { state = .paused }
+        case .speaking: remotePause()
+        case .paused: remotePlay()
+        case .stopped: startCurrentPage()
+        case .loading: break
+        }
+    }
+
+    private func remotePlay() {
+        switch state {
         case .paused:
-            if synthesizer.continueSpeaking() { state = .speaking }
-            else { startCurrentPage() }
-        case .stopped, .loading:
-            startCurrentPage()
+            if synthesizer.continueSpeaking() {
+                state = .speaking
+                publishNowPlaying()
+            } else {
+                startCurrentPage()
+            }
+        case .stopped: startCurrentPage()
+        case .speaking, .loading: break
+        }
+    }
+
+    private func remotePause() {
+        guard state == .speaking else { return }
+        if synthesizer.pauseSpeaking(at: .immediate) {
+            state = .paused
+            publishNowPlaying()
         }
     }
 
     func stop() {
+        stopAudio()
+        cancelSleepTimer()
+    }
+
+    private func stopAudio() {
         generation &+= 1
         task?.cancel()
         task = nil
         currentUtterance = nil
         chunks.removeAll()
+        sentenceRanges.removeAll()
+        currentSentenceIndex = -1
         chunkIndex = 0
         synthesizer.stopSpeaking(at: .immediate)
         state = .stopped
         recognizedPage = false
+        spokenSentence = ""
+        publishNowPlaying()
     }
 
     func nextPage() { go(to: currentPage + 1) }
@@ -104,16 +176,51 @@ final class BookSpeechPlayer: NSObject, ObservableObject, AVSpeechSynthesizerDel
         let target = min(max(page, 0), pageCount - 1)
         guard target != currentPage else { return }
         let wasPlaying = state == .speaking || state == .loading
-        stop()
+        stopAudio() // Keep sleep timer running across page transitions.
         currentPage = target
         pageProgress = 0
         notifyPosition()
         if wasPlaying { startCurrentPage() }
+        else { publishNowPlaying() }
     }
 
     private func notifyPosition() {
         if let id = activeBookID { didChangePage?(id, currentPage) }
     }
+
+    // MARK: - Sleep timer
+
+    func startSleepTimer(minutes: Int) {
+        guard minutes > 0 else { cancelSleepTimer(); return }
+        sleepTimer?.invalidate()
+        sleepDeadline = Date().addingTimeInterval(Double(minutes) * 60)
+        refreshSleepTimer()
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refreshSleepTimer() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        sleepTimer = timer
+    }
+
+    func cancelSleepTimer() {
+        sleepTimer?.invalidate()
+        sleepTimer = nil
+        sleepDeadline = nil
+        sleepRemainingSeconds = 0
+    }
+
+    private func refreshSleepTimer() {
+        guard let deadline = sleepDeadline else { return }
+        let remaining = max(0, Int(ceil(deadline.timeIntervalSinceNow)))
+        sleepRemainingSeconds = remaining
+        if remaining == 0 {
+            stopAudio()
+            cancelSleepTimer()
+            notice = "Таймер сна завершён. Чтение остановлено."
+        }
+    }
+
+    // MARK: - Reading
 
     private func startCurrentPage() {
         guard let pdf = document,
@@ -127,10 +234,14 @@ final class BookSpeechPlayer: NSObject, ObservableObject, AVSpeechSynthesizerDel
         currentUtterance = nil
         chunks = []
         chunkIndex = 0
+        sentenceRanges = []
+        currentSentenceIndex = -1
         pageProgress = 0
+        spokenSentence = ""
         notice = nil
         recognizedPage = false
         state = .loading
+        publishNowPlaying()
 
         let index = currentPage
         task = Task { [weak self] in
@@ -141,6 +252,7 @@ final class BookSpeechPlayer: NSObject, ObservableObject, AVSpeechSynthesizerDel
             guard !result.isEmpty else {
                 self.state = .stopped
                 self.notice = "На странице \(index + 1) не найден текст. Попробуй следующую страницу."
+                self.publishNowPlaying()
                 return
             }
             self.chunks = Self.splitIntoChunks(result)
@@ -150,16 +262,13 @@ final class BookSpeechPlayer: NSObject, ObservableObject, AVSpeechSynthesizerDel
     }
 
     private func speakChunk() {
-        guard chunkIndex < chunks.count else {
-            finishPage()
-            return
-        }
+        guard chunkIndex < chunks.count else { finishPage(); return }
         let text = chunks[chunkIndex]
         let utterance = AVSpeechUtterance(string: text)
         utterance.rate = rate
         utterance.pitchMultiplier = 1.0
         utterance.voice = resolveVoice(for: text)
-        utterance.postUtteranceDelay = 0.06
+        utterance.postUtteranceDelay = 0.02
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .spokenAudio)
@@ -168,12 +277,16 @@ final class BookSpeechPlayer: NSObject, ObservableObject, AVSpeechSynthesizerDel
             notice = "Не удалось настроить звук: \(error.localizedDescription)"
         }
         currentUtterance = utterance
+        sentenceRanges = Self.sentenceRanges(in: text)
+        currentSentenceIndex = -1
         state = .speaking
         synthesizer.speak(utterance)
+        publishNowPlaying()
     }
 
     private func finishPage() {
         currentUtterance = nil
+        spokenSentence = ""
         if currentPage + 1 < pageCount {
             currentPage += 1
             pageProgress = 0
@@ -182,8 +295,59 @@ final class BookSpeechPlayer: NSObject, ObservableObject, AVSpeechSynthesizerDel
         } else {
             pageProgress = 1
             state = .stopped
+            cancelSleepTimer()
             notice = "Книга закончилась"
+            publishNowPlaying()
         }
+    }
+
+    // MARK: - Voice + sentence tracking
+
+    private func handleStarted(_ utterance: AVSpeechUtterance) {
+        guard currentUtterance === utterance else { return }
+        updateCurrentSentence(in: utterance, at: 0)
+    }
+
+    private func handleWord(_ utterance: AVSpeechUtterance, range: NSRange) {
+        guard currentUtterance === utterance else { return }
+        updateCurrentSentence(in: utterance, at: range.location)
+        let length = max(1, (utterance.speechString as NSString).length)
+        let fraction = Double(min(length, range.location)) / Double(length)
+        let progress = (Double(chunkIndex) + fraction) / Double(max(1, chunks.count))
+        if progress - pageProgress >= 0.015 { pageProgress = progress }
+    }
+
+    private func handleFinished(_ utterance: AVSpeechUtterance) {
+        guard currentUtterance === utterance else { return }
+        currentUtterance = nil
+        chunkIndex += 1
+        pageProgress = Double(chunkIndex) / Double(max(1, chunks.count))
+        speakChunk()
+    }
+
+    private func updateCurrentSentence(in utterance: AVSpeechUtterance, at offset: Int) {
+        guard let index = sentenceRanges.firstIndex(where: {
+            $0.location <= offset && offset < NSMaxRange($0)
+        }) ?? sentenceRanges.indices.last else { return }
+        guard currentSentenceIndex != index else { return }
+        currentSentenceIndex = index
+        let nsText = utterance.speechString as NSString
+        let range = sentenceRanges[index]
+        guard NSMaxRange(range) <= nsText.length, range.length > 0 else { return }
+        spokenSentence = nsText.substring(with: range).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func sentenceRanges(in text: String) -> [NSRange] {
+        let tokenizer = NLTokenizer(unit: .sentence)
+        tokenizer.string = text
+        var result: [NSRange] = []
+        tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
+            let span = NSRange(range, in: text)
+            if span.length > 0 { result.append(span) }
+            return true
+        }
+        if result.isEmpty { result = [NSRange(location: 0, length: (text as NSString).length)] }
+        return result
     }
 
     private func resolveVoice(for text: String) -> AVSpeechSynthesisVoice? {
@@ -225,21 +389,9 @@ final class BookSpeechPlayer: NSObject, ObservableObject, AVSpeechSynthesizerDel
         return result
     }
 
-    // MARK: - AVSpeechSynthesizerDelegate
-
-    @objc(speechSynthesizer:didFinishSpeechUtterance:)
-    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        Task { @MainActor [weak self] in
-            guard let self, self.currentUtterance === utterance else { return }
-            self.currentUtterance = nil
-            self.chunkIndex += 1
-            self.pageProgress = Double(self.chunkIndex) / Double(max(1, self.chunks.count))
-            self.speakChunk()
-        }
-    }
-
-    @objc(speechSynthesizer:didCancelSpeechUtterance:)
-    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        // A stop/skip invalidates the current utterance before cancellation is delivered.
+    private func publishNowPlaying() {
+        guard activeBookID != nil else { return }
+        remote.publish(title: activeBookTitle, page: currentPage, total: pageCount,
+                       isPlaying: state == .speaking, artwork: artwork)
     }
 }

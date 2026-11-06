@@ -8,6 +8,7 @@ struct ReaderView: View {
     @State private var document: PDFDocument?
     @State private var showSettings = false
     @State private var showPageJump = false
+    @State private var showSleepTimer = false
     @State private var pageInput = "1"
 
     private var book: Book? { library.books.first(where: { $0.id == bookID }) }
@@ -27,6 +28,7 @@ struct ReaderView: View {
             .toolbar { settingsToolbar }
             .sheet(isPresented: $showSettings) { settingsSheet }
             .sheet(isPresented: $showPageJump) { pageJumpSheet }
+            .sheet(isPresented: $showSleepTimer) { sleepTimerSheet }
             .onAppear(perform: openBook)
     }
 
@@ -43,7 +45,7 @@ struct ReaderView: View {
         VStack(spacing: 10) {
             pageHeader
             pageProgressView
-            PDFPageViewer(document: document, pageIndex: page)
+            PDFPageViewer(document: document, pageIndex: page, sentence: player.spokenSentence)
                 .background(Color(uiColor: .secondarySystemGroupedBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .overlay {
@@ -100,6 +102,12 @@ struct ReaderView: View {
             .presentationDragIndicator(.visible)
     }
 
+    private var sleepTimerSheet: some View {
+        SleepTimerSheet()
+            .environmentObject(player)
+            .presentationDragIndicator(.visible)
+    }
+
     private var targetPageIndex: Int? {
         guard let number = Int(pageInput), (1...safePageCount).contains(number) else {
             return nil
@@ -151,6 +159,7 @@ struct ReaderView: View {
     private var playerPanel: some View {
         VStack(spacing: 14) {
             playerStatus
+            if !player.spokenSentence.isEmpty { spokenSentencePanel }
             playbackControls
             secondaryControls
             if let notice = player.notice {
@@ -185,6 +194,23 @@ struct ReaderView: View {
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
+    }
+
+    private var spokenSentencePanel: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label("Сейчас звучит", systemImage: "text.quote")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Text(player.spokenSentence)
+                .font(.system(size: 13, weight: .medium))
+                .lineSpacing(3)
+                .lineLimit(3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityLabel("Текущее предложение: \(player.spokenSentence)")
+        }
+        .padding(12)
+        .background(Color(uiColor: .secondarySystemGroupedBackground),
+                    in: RoundedRectangle(cornerRadius: 13, style: .continuous))
     }
 
     private var playbackControls: some View {
@@ -241,6 +267,13 @@ struct ReaderView: View {
 
             Spacer()
 
+            Button { showSleepTimer = true } label: {
+                Label(sleepLabel, systemImage: "moon.stars")
+            }
+            .accessibilityLabel("Таймер сна")
+
+            Spacer()
+
             Button { showSettings = true } label: {
                 Label("Голос и скорость", systemImage: "waveform.circle")
             }
@@ -248,6 +281,12 @@ struct ReaderView: View {
         .font(.system(size: 12, weight: .semibold))
         .buttonStyle(.plain)
         .foregroundStyle(.secondary)
+    }
+
+    private var sleepLabel: String {
+        let remaining = player.sleepRemainingSeconds
+        guard remaining > 0 else { return "Сон" }
+        return String(format: "%02d:%02d", remaining / 60, remaining % 60)
     }
 
     private var statusText: String {
@@ -263,6 +302,7 @@ struct ReaderView: View {
 private struct PDFPageViewer: UIViewRepresentable {
     let document: PDFDocument
     let pageIndex: Int
+    let sentence: String
 
     func makeUIView(context: Context) -> PDFView {
         let view = PDFView()
@@ -279,6 +319,46 @@ private struct PDFPageViewer: UIViewRepresentable {
         if let desiredPage = document.page(at: pageIndex), view.currentPage !== desiredPage {
             view.go(to: desiredPage)
         }
+        updateHighlight(in: view)
+    }
+
+    private func updateHighlight(in view: PDFView) {
+        guard let page = document.page(at: pageIndex),
+              let pageText = page.string,
+              !pageText.isEmpty,
+              !sentence.isEmpty else {
+            view.highlightedSelections = nil
+            return
+        }
+
+        // PDFKit's character ranges are UTF-16 positions in the original page text.
+        // OCR-only images have no such positions; the sentence panel still works.
+        let words = sentence.split(whereSeparator: { $0.isWhitespace })
+        let source = pageText as NSString
+        var found = NSRange(location: NSNotFound, length: 0)
+        let minimum = min(words.count, 3)
+        let lengths = [words.count] + Array(stride(from: min(8, words.count), through: minimum, by: -1))
+        for length in lengths where length > 0 {
+            let prefix = words.prefix(length).map(String.init)
+            // Allow line breaks between words in PDF's original text layer.
+            let pattern = prefix.map { NSRegularExpression.escapedPattern(for: $0) }
+                .joined(separator: "\\s+")
+            guard let expression = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+                continue
+            }
+            if let match = expression.firstMatch(in: pageText, range: NSRange(location: 0, length: source.length)) {
+                found = match.range
+                break
+            }
+        }
+        guard found.location != NSNotFound, found.length > 0,
+              NSMaxRange(found) <= source.length,
+              let selection = page.selection(for: found) else {
+            view.highlightedSelections = nil
+            return
+        }
+        selection.color = UIColor.systemYellow.withAlphaComponent(0.4)
+        view.highlightedSelections = [selection]
     }
 }
 

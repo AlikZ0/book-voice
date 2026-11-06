@@ -66,7 +66,7 @@ struct SettingsView: View {
                 .font(.subheadline)
 
                 Section {
-                    Text("BookVoice 1.0 · PDF Reader")
+                    Text("BookVoice 1.2 · PDF Reader")
                         .foregroundStyle(.secondary)
                 }
             }
