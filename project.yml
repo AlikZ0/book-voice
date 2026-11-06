@@ -1,0 +1,43 @@
+name: BookVoice
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: '16.0'
+settings:
+  base:
+    SWIFT_VERSION: '5.0'
+    IPHONEOS_DEPLOYMENT_TARGET: '16.0'
+    TARGETED_DEVICE_FAMILY: '1,2'
+    SUPPORTS_MACCATALYST: NO
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: '1.0.0'
+    CURRENT_PROJECT_VERSION: '1'
+targets:
+  BookVoice:
+    type: application
+    platform: iOS
+    sources:
+      - path: BookVoice
+    info:
+      path: BookVoice/Info.plist
+      properties:
+        CFBundleDisplayName: BookVoice
+        UILaunchScreen: {}
+        UIBackgroundModes:
+          - audio
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.BookVoice
+        SWIFT_EMIT_LOC_STRINGS: YES
+schemes:
+  BookVoice:
+    build:
+      targets:
+        BookVoice: all
+    run:
+      config: Debug
+    archive:
+      config: Release
