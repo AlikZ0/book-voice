@@ -22,6 +22,8 @@ final class BookSpeechPlayer: NSObject, ObservableObject {
 
     @Published var rate: Float = 0.5
     @Published var chosenVoiceID = "automatic"
+    @Published private(set) var pitch: Float = 1.0
+    @Published private(set) var paragraphPause: Double = 0.20
 
     private let synthesizer = AVSpeechSynthesizer()
     private let speechDelegate = SpeechDelegateProxy()
@@ -31,7 +33,12 @@ final class BookSpeechPlayer: NSObject, ObservableObject {
     private var activeBookTitle = "BookVoice"
     private var artwork: MPMediaItemArtwork?
     private var task: Task<Void, Never>?
-    private var chunks: [String] = []
+    private struct SpeechChunk {
+        let text: String
+        let endsParagraph: Bool
+    }
+
+    private var chunks: [SpeechChunk] = []
     private var chunkIndex = 0
     private var currentUtterance: AVSpeechUtterance?
     private var sentenceRanges: [NSRange] = []
@@ -58,6 +65,12 @@ final class BookSpeechPlayer: NSObject, ObservableObject {
         let stored = UserDefaults.standard.float(forKey: "speechRate")
         rate = stored == 0 ? 0.5 : stored
         chosenVoiceID = UserDefaults.standard.string(forKey: "voiceID") ?? "automatic"
+        if UserDefaults.standard.object(forKey: "speechPitch") != nil {
+            pitch = min(1.2, max(0.8, UserDefaults.standard.float(forKey: "speechPitch")))
+        }
+        if UserDefaults.standard.object(forKey: "speechParagraphPause") != nil {
+            paragraphPause = min(0.7, max(0, UserDefaults.standard.double(forKey: "speechParagraphPause")))
+        }
 
         remote.install(
             play: { [weak self] in self?.remotePlay() },
@@ -109,6 +122,16 @@ final class BookSpeechPlayer: NSObject, ObservableObject {
     func setRate(_ value: Float) {
         rate = value
         UserDefaults.standard.set(value, forKey: "speechRate")
+    }
+
+    func setPitch(_ value: Float) {
+        pitch = min(1.2, max(0.8, value))
+        UserDefaults.standard.set(pitch, forKey: "speechPitch")
+    }
+
+    func setParagraphPause(_ seconds: Double) {
+        paragraphPause = min(0.7, max(0, seconds))
+        UserDefaults.standard.set(paragraphPause, forKey: "speechParagraphPause")
     }
 
     func setVoice(_ id: String) {
@@ -263,12 +286,13 @@ final class BookSpeechPlayer: NSObject, ObservableObject {
 
     private func speakChunk() {
         guard chunkIndex < chunks.count else { finishPage(); return }
-        let text = chunks[chunkIndex]
+        let chunk = chunks[chunkIndex]
+        let text = chunk.text
         let utterance = AVSpeechUtterance(string: text)
         utterance.rate = rate
-        utterance.pitchMultiplier = 1.0
+        utterance.pitchMultiplier = pitch
         utterance.voice = resolveVoice(for: text)
-        utterance.postUtteranceDelay = 0.02
+        utterance.postUtteranceDelay = chunk.endsParagraph ? paragraphPause : 0.03
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .spokenAudio)
@@ -350,13 +374,29 @@ final class BookSpeechPlayer: NSObject, ObservableObject {
         return result
     }
 
+    // Highest-quality *installed* voice for the detected language. Premium and
+    // enhanced voices cannot be downloaded directly by a third-party app.
     private func resolveVoice(for text: String) -> AVSpeechSynthesisVoice? {
         let voices = AVSpeechSynthesisVoice.speechVoices()
-        if chosenVoiceID != "automatic", let selected = voices.first(where: { $0.identifier == chosenVoiceID }) {
+        if chosenVoiceID != "automatic",
+           let selected = voices.first(where: { $0.identifier == chosenVoiceID }) {
             return selected
         }
         let language = Self.detectLanguage(text)
-        return voices.first(where: { $0.language == language }) ?? AVSpeechSynthesisVoice(language: language)
+        let baseCode = language.split(separator: "-").first.map(String.init) ?? language
+        let candidates = voices.filter {
+            $0.language.split(separator: "-").first.map(String.init) == baseCode
+        }
+        let best = candidates.sorted { first, second in
+            if first.quality.rawValue != second.quality.rawValue {
+                return first.quality.rawValue > second.quality.rawValue
+            }
+            let firstLocale = first.language == language ? 1 : 0
+            let secondLocale = second.language == language ? 1 : 0
+            if firstLocale != secondLocale { return firstLocale > secondLocale }
+            return first.name.localizedStandardCompare(second.name) == .orderedAscending
+        }.first
+        return best ?? AVSpeechSynthesisVoice(language: language)
     }
 
     private static func detectLanguage(_ text: String) -> String {
@@ -370,22 +410,77 @@ final class BookSpeechPlayer: NSObject, ObservableObject {
         return "en-US"
     }
 
-    private static func splitIntoChunks(_ source: String, maximum: Int = 850) -> [String] {
-        let cleaned = source.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleaned.isEmpty else { return [] }
-        var result: [String] = []
-        var chunk = ""
-        for word in cleaned.split(separator: " ") {
-            let token = String(word)
-            if chunk.count + token.count + 1 > maximum && !chunk.isEmpty {
-                result.append(chunk)
-                chunk = token
-            } else {
-                chunk += chunk.isEmpty ? token : " " + token
+    // Preserve sentence boundaries and real paragraph breaks, rather than
+    // chopping at arbitrary words. It improves phrasing without cloud APIs.
+    private static func splitIntoChunks(_ source: String, maximum: Int = 720) -> [SpeechChunk] {
+        let normalized = source.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let separated = normalized.replacingOccurrences(
+            of: #"\n[ \t]*\n+"#, with: "\u{E000}", options: .regularExpression
+        )
+        var output: [SpeechChunk] = []
+
+        for rawParagraph in separated.components(separatedBy: "\u{E000}") {
+            let paragraph = rawParagraph.replacingOccurrences(
+                of: #"\s+"#, with: " ", options: .regularExpression
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !paragraph.isEmpty else { continue }
+
+            let tokenizer = NLTokenizer(unit: .sentence)
+            tokenizer.string = paragraph
+            var sentences: [String] = []
+            tokenizer.enumerateTokens(in: paragraph.startIndex..<paragraph.endIndex) { range, _ in
+                let sentence = String(paragraph[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !sentence.isEmpty { sentences.append(sentence) }
+                return true
+            }
+            if sentences.isEmpty { sentences = [paragraph] }
+
+            var buffer = ""
+            for sentence in sentences {
+                // Very long unpunctuated sentences are split only at word edges.
+                for part in splitLongSentence(sentence, maximum: maximum) {
+                    if !buffer.isEmpty && buffer.count + 1 + part.count > maximum {
+                        output.append(SpeechChunk(text: buffer, endsParagraph: false))
+                        buffer = ""
+                    }
+                    buffer += buffer.isEmpty ? part : " " + part
+                }
+            }
+            if !buffer.isEmpty {
+                output.append(SpeechChunk(text: buffer, endsParagraph: true))
+            } else if let last = output.indices.last {
+                let lastChunk = output[last]
+                output[last] = SpeechChunk(text: lastChunk.text, endsParagraph: true)
             }
         }
-        if !chunk.isEmpty { result.append(chunk) }
+        return output
+    }
+
+    private static func splitLongSentence(_ sentence: String, maximum: Int) -> [String] {
+        guard sentence.count > maximum else { return [sentence] }
+        var result: [String] = []
+        var buffer = ""
+        for piece in sentence.split(separator: " ") {
+            let word = String(piece)
+            if !buffer.isEmpty && buffer.count + word.count + 1 > maximum {
+                result.append(buffer)
+                buffer = ""
+            }
+            // Extremely long tokens are uncommon in books; never discard text.
+            if word.count > maximum {
+                if !buffer.isEmpty { result.append(buffer); buffer = "" }
+                var remaining = word[...]
+                while !remaining.isEmpty {
+                    let end = remaining.index(remaining.startIndex, offsetBy: maximum, limitedBy: remaining.endIndex) ?? remaining.endIndex
+                    result.append(String(remaining[..<end]))
+                    remaining = remaining[end...]
+                }
+            } else {
+                buffer += buffer.isEmpty ? word : " " + word
+            }
+        }
+        if !buffer.isEmpty { result.append(buffer) }
         return result
     }
 
